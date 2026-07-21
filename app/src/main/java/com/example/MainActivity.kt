@@ -480,23 +480,27 @@ fun executeSOS(context: Context, number: String) {
   try {
     val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
     
-    fusedLocationClient.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null)
-      .addOnSuccessListener { location: Location? ->
-        val message = if (location != null) {
-          "SOS! Preciso de ajuda. Minha localização: https://maps.google.com/?q=${location.latitude},${location.longitude}"
-        } else {
-          "SOS! Preciso de ajuda. (Localização indisponível)"
-        }
-        sendSms(context, number, message)
+    // Obtain last location quickly to ensure SMS is sent before the app goes to the background
+    fusedLocationClient.lastLocation.addOnCompleteListener { task ->
+      val location = if (task.isSuccessful) task.result else null
+      val message = if (location != null) {
+        "SOS! Preciso de ajuda. Minha localização: https://maps.google.com/?q=${location.latitude},${location.longitude}"
+      } else {
+        "SOS! Preciso de ajuda. (Localização indisponível)"
       }
-      .addOnFailureListener {
-        sendSms(context, number, "SOS! Preciso de ajuda. (Erro ao buscar localização)")
-      }
+      
+      // Send SMS prior to launching the dialer intent
+      sendSms(context, number, message)
 
-    val callIntent = Intent(Intent.ACTION_CALL)
-    callIntent.data = Uri.parse("tel:$number")
-    callIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-    context.startActivity(callIntent)
+      try {
+        val callIntent = Intent(Intent.ACTION_CALL)
+        callIntent.data = Uri.parse("tel:$number")
+        callIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        context.startActivity(callIntent)
+      } catch (e: Exception) {
+        e.printStackTrace()
+      }
+    }
 
   } catch (e: Exception) {
     e.printStackTrace()
@@ -506,8 +510,21 @@ fun executeSOS(context: Context, number: String) {
 
 fun sendSms(context: Context, number: String, message: String) {
   try {
-    val smsManager = context.getSystemService(SmsManager::class.java)
-    smsManager?.sendTextMessage(number, null, message, null, null)
+    val smsManager: SmsManager = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+      context.getSystemService(SmsManager::class.java)
+    } else {
+      @Suppress("DEPRECATION")
+      SmsManager.getDefault()
+    }
+    
+    val parts = smsManager?.divideMessage(message)
+    if (parts != null && parts.isNotEmpty()) {
+      if (parts.size > 1) {
+        smsManager.sendMultipartTextMessage(number, null, parts, null, null)
+      } else {
+        smsManager.sendTextMessage(number, null, message, null, null)
+      }
+    }
     Toast.makeText(context, "SMS enviado!", Toast.LENGTH_SHORT).show()
   } catch (e: Exception) {
     e.printStackTrace()

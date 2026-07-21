@@ -3,12 +3,9 @@ package com.example
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
-import android.net.Uri
 import android.os.Bundle
-import android.telephony.SmsManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -40,6 +37,15 @@ import com.example.ui.theme.MyApplicationTheme
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -72,12 +78,11 @@ fun SOSApp(modifier: Modifier = Modifier) {
   val context = LocalContext.current
   val sharedPrefs = remember { context.getSharedPreferences("sos_prefs", Context.MODE_PRIVATE) }
   
-  var emergencyNumber by remember { mutableStateOf(sharedPrefs.getString("emergency_number", "") ?: "") }
+  var webhookUrl by remember { mutableStateOf(sharedPrefs.getString("webhook_url", "") ?: "") }
+  var senderName by remember { mutableStateOf(sharedPrefs.getString("sender_name", "") ?: "") }
   var appState by remember { mutableStateOf(AppState.CHECKING) }
 
   val requiredPermissions = arrayOf(
-    Manifest.permission.CALL_PHONE,
-    Manifest.permission.SEND_SMS,
     Manifest.permission.ACCESS_FINE_LOCATION,
     Manifest.permission.ACCESS_COARSE_LOCATION
   )
@@ -86,7 +91,7 @@ fun SOSApp(modifier: Modifier = Modifier) {
     ActivityResultContracts.RequestMultiplePermissions()
   ) { permissions ->
     val allGranted = permissions.entries.all { it.value }
-    if (allGranted && emergencyNumber.isNotBlank()) {
+    if (allGranted && webhookUrl.isNotBlank() && senderName.isNotBlank()) {
       appState = AppState.COUNTDOWN
     } else if (!allGranted) {
       Toast.makeText(context, "Permissões necessárias para funcionar.", Toast.LENGTH_LONG).show()
@@ -95,7 +100,7 @@ fun SOSApp(modifier: Modifier = Modifier) {
   }
 
   LaunchedEffect(Unit) {
-    if (emergencyNumber.isBlank()) {
+    if (webhookUrl.isBlank() || senderName.isBlank()) {
       appState = AppState.SETUP
     } else {
       val hasPermissions = requiredPermissions.all {
@@ -118,10 +123,15 @@ fun SOSApp(modifier: Modifier = Modifier) {
     AppState.SETUP -> {
       SetupScreen(
         modifier = modifier,
-        initialNumber = emergencyNumber,
-        onSave = { number ->
-          sharedPrefs.edit().putString("emergency_number", number).apply()
-          emergencyNumber = number
+        initialWebhookUrl = webhookUrl,
+        initialSenderName = senderName,
+        onSave = { url, name ->
+          sharedPrefs.edit()
+            .putString("webhook_url", url)
+            .putString("sender_name", name)
+            .apply()
+          webhookUrl = url
+          senderName = name
           permissionLauncher.launch(requiredPermissions)
         }
       )
@@ -131,7 +141,7 @@ fun SOSApp(modifier: Modifier = Modifier) {
         modifier = modifier,
         onCancel = { appState = AppState.SETUP },
         onTrigger = {
-          executeSOS(context, emergencyNumber)
+          executeSOS(context, webhookUrl, senderName)
           appState = AppState.EXECUTED
         }
       )
@@ -146,8 +156,14 @@ fun SOSApp(modifier: Modifier = Modifier) {
 }
 
 @Composable
-fun SetupScreen(modifier: Modifier = Modifier, initialNumber: String, onSave: (String) -> Unit) {
-  var number by remember { mutableStateOf(initialNumber) }
+fun SetupScreen(
+  modifier: Modifier = Modifier, 
+  initialWebhookUrl: String, 
+  initialSenderName: String, 
+  onSave: (String, String) -> Unit
+) {
+  var url by remember { mutableStateOf(initialWebhookUrl) }
+  var name by remember { mutableStateOf(initialSenderName) }
 
   Column(
     modifier = modifier
@@ -178,25 +194,34 @@ fun SetupScreen(modifier: Modifier = Modifier, initialNumber: String, onSave: (S
     )
     Spacer(modifier = Modifier.height(8.dp))
     Text(
-      text = "Insira o número de telefone para o qual deseja ligar e enviar o SMS de emergência.",
+      text = "Configure seu webhook do Microsoft Teams e seu nome para enviar alertas de emergência.",
       fontSize = 14.sp,
       color = Color(0xFF49454F),
       textAlign = TextAlign.Center
     )
     Spacer(modifier = Modifier.height(32.dp))
     OutlinedTextField(
-      value = number,
-      onValueChange = { number = it },
-      label = { Text("Número de Emergência") },
-      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+      value = name,
+      onValueChange = { name = it },
+      label = { Text("Seu Nome") },
+      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+      modifier = Modifier.fillMaxWidth(),
+      shape = RoundedCornerShape(12.dp)
+    )
+    Spacer(modifier = Modifier.height(16.dp))
+    OutlinedTextField(
+      value = url,
+      onValueChange = { url = it },
+      label = { Text("URL do Webhook do Teams") },
+      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
       modifier = Modifier.fillMaxWidth(),
       shape = RoundedCornerShape(12.dp)
     )
     Spacer(modifier = Modifier.height(32.dp))
     Button(
       onClick = {
-        if (number.isNotBlank()) {
-          onSave(number)
+        if (url.isNotBlank() && name.isNotBlank()) {
+          onSave(url, name)
         }
       },
       modifier = Modifier
@@ -298,7 +323,7 @@ fun CountdownScreen(modifier: Modifier = Modifier, onCancel: () -> Unit, onTrigg
         Spacer(modifier = Modifier.height(48.dp))
         
         Text(
-          text = "Chamando Contato de Emergência",
+          text = "Enviando alerta para o Teams",
           fontSize = 20.sp,
           fontWeight = FontWeight.Medium,
           color = Color(0xFFB3261E)
@@ -317,8 +342,8 @@ fun CountdownScreen(modifier: Modifier = Modifier, onCancel: () -> Unit, onTrigg
           )
           StatusCard(
             icon = "💬",
-            title = "SMS Automático",
-            subtitle = "Link do Google Maps gerado",
+            title = "Alerta do Teams",
+            subtitle = "Canal de emergência",
             statusText = "AGUARDANDO",
             statusColor = Color(0xFFD97706)
           )
@@ -428,7 +453,7 @@ fun ExecutedScreen(modifier: Modifier = Modifier, onReset: () -> Unit) {
         Spacer(modifier = Modifier.height(8.dp))
         
         Text(
-          text = "A ligação foi iniciada e o SMS com sua localização foi enviado.",
+          text = "O alerta foi enviado para o Teams com sua localização.",
           fontSize = 14.sp,
           color = Color(0xFF49454F),
           textAlign = TextAlign.Center
@@ -447,8 +472,8 @@ fun ExecutedScreen(modifier: Modifier = Modifier, onReset: () -> Unit) {
           )
           StatusCard(
             icon = "💬",
-            title = "SMS Automático",
-            subtitle = "Enviado com link do Maps",
+            title = "Alerta do Teams",
+            subtitle = "Mensagem recebida pelo webhook",
             statusText = "ENVIADO",
             statusColor = Color(0xFF16A34A)
           )
@@ -476,58 +501,67 @@ fun ExecutedScreen(modifier: Modifier = Modifier, onReset: () -> Unit) {
 }
 
 @SuppressLint("MissingPermission")
-fun executeSOS(context: Context, number: String) {
+fun executeSOS(context: Context, webhookUrl: String, senderName: String) {
   try {
     val fusedLocationClient = LocationServices.getFusedLocationProviderClient(context)
     
-    // Obtain last location quickly to ensure SMS is sent before the app goes to the background
+    // Obtain last location quickly
     fusedLocationClient.lastLocation.addOnCompleteListener { task ->
       val location = if (task.isSuccessful) task.result else null
-      val message = if (location != null) {
-        "SOS! Preciso de ajuda. Minha localização: https://maps.google.com/?q=${location.latitude},${location.longitude}"
+      val mapsLink = if (location != null) {
+        "https://maps.google.com/?q=${location.latitude},${location.longitude}"
       } else {
-        "SOS! Preciso de ajuda. (Localização indisponível)"
+        "Localização indisponível"
       }
       
-      // Send SMS prior to launching the dialer intent
-      sendSms(context, number, message)
-
-      try {
-        val callIntent = Intent(Intent.ACTION_CALL)
-        callIntent.data = Uri.parse("tel:$number")
-        callIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        context.startActivity(callIntent)
-      } catch (e: Exception) {
-        e.printStackTrace()
-      }
+      sendTeamsWebhook(context, webhookUrl, senderName, mapsLink)
     }
 
   } catch (e: Exception) {
     e.printStackTrace()
-    Toast.makeText(context, "Erro ao executar SOS: ${e.message}", Toast.LENGTH_LONG).show()
+    Toast.makeText(context, "Erro ao obter localização: ${e.message}", Toast.LENGTH_LONG).show()
   }
 }
 
-fun sendSms(context: Context, number: String, message: String) {
-  try {
-    val smsManager: SmsManager = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
-      context.getSystemService(SmsManager::class.java)
-    } else {
-      @Suppress("DEPRECATION")
-      SmsManager.getDefault()
-    }
-    
-    val parts = smsManager?.divideMessage(message)
-    if (parts != null && parts.isNotEmpty()) {
-      if (parts.size > 1) {
-        smsManager.sendMultipartTextMessage(number, null, parts, null, null)
-      } else {
-        smsManager.sendTextMessage(number, null, message, null, null)
+fun sendTeamsWebhook(context: Context, webhookUrl: String, senderName: String, mapsLink: String) {
+  val client = OkHttpClient()
+  val jsonType = "application/json; charset=utf-8".toMediaType()
+
+  val factsArray = JSONArray().apply {
+    put(JSONObject().apply {
+      put("name", "Localização:")
+      put("value", if (mapsLink.startsWith("http")) "[Ver no Mapa]($mapsLink)" else mapsLink)
+    })
+  }
+
+  val section = JSONObject().apply {
+    put("activityTitle", "🚨 SOS Emergência - Alerta 🚨")
+    put("activitySubtitle", "Enviado por: **$senderName**")
+    put("facts", factsArray)
+  }
+
+  val json = JSONObject().apply {
+    put("@type", "MessageCard")
+    put("@context", "http://schema.org/extensions")
+    put("themeColor", "B3261E")
+    put("summary", "Alerta de SOS Emergência")
+    put("sections", JSONArray().put(section))
+  }
+
+  val body = json.toString().toRequestBody(jsonType)
+  val request = Request.Builder()
+    .url(webhookUrl)
+    .post(body)
+    .build()
+
+  CoroutineScope(Dispatchers.IO).launch {
+    try {
+      val response = client.newCall(request).execute()
+      if (!response.isSuccessful) {
+        throw java.io.IOException("Unexpected code $response")
       }
+    } catch (e: Exception) {
+      e.printStackTrace()
     }
-    Toast.makeText(context, "SMS enviado!", Toast.LENGTH_SHORT).show()
-  } catch (e: Exception) {
-    e.printStackTrace()
-    Toast.makeText(context, "Falha ao enviar SMS.", Toast.LENGTH_SHORT).show()
   }
 }
